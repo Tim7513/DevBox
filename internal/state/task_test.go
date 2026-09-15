@@ -146,20 +146,19 @@ func TestStaleWorkerIsFencedOut(t *testing.T) {
 	}
 }
 
-// TestCapacityReleasedExactlyOnce walks every path out of a reserved state and
-// asserts the reservation is handed back exactly once — never leaked (which
-// would strand worker capacity forever) and never double-released (which would
-// let the fleet be overcommitted).
-func TestCapacityReleasedExactlyOnce(t *testing.T) {
+// TestFailedPlacementRollsBackCapacityExactlyOnce walks every *unsuccessful*
+// path out of a reserved placing task. The compute it was reserving never came
+// into existence, so the provisional reservation must go back to the pool
+// exactly once — never leaked (stranding worker capacity forever) and never
+// double-released (letting the fleet be overcommitted).
+func TestFailedPlacementRollsBackCapacityExactlyOnce(t *testing.T) {
 	exits := []struct {
 		name string
 		from TaskState
 		ev   TaskEvent
 	}{
-		{"leased→succeeded", TaskLeased, TaskEvent{Kind: EvSucceed, FencingToken: 3}},
 		{"leased→failed", TaskLeased, TaskEvent{Kind: EvFail, FencingToken: 3, Err: "boom"}},
 		{"leased→expired", TaskLeased, TaskEvent{Kind: EvLeaseExpire}},
-		{"running→succeeded", TaskRunning, TaskEvent{Kind: EvSucceed, FencingToken: 3}},
 		{"running→failed", TaskRunning, TaskEvent{Kind: EvFail, FencingToken: 3, Err: "boom"}},
 		{"running→expired", TaskRunning, TaskEvent{Kind: EvLeaseExpire}},
 	}
@@ -181,6 +180,141 @@ func TestCapacityReleasedExactlyOnce(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestReservationLifecycleByTaskType is the corrected capacity model. A
+// successful provision must NOT return its capacity to the pool: the container
+// is running and physically occupying it. Releasing there would let the
+// scheduler re-sell resources that are in use — the exact overcommit this model
+// exists to prevent.
+func TestReservationLifecycleByTaskType(t *testing.T) {
+	t.Run("placing task reserves on lease", func(t *testing.T) {
+		for _, tt := range []TaskType{TaskProvision, TaskStart, TaskRecover} {
+			cur := Task{Type: tt, State: TaskQueued, MaxAttempts: 5, FencingToken: 1}
+			res, err := ApplyTask(cur, TaskEvent{Kind: EvLease, FencingToken: 2, WorkerID: "w1"}, t0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !res.Next.Reserved {
+				t.Errorf("%s: must hold a provisional reservation", tt)
+			}
+			if countEffect[ReserveCapacity](res.Effects) != 1 {
+				t.Errorf("%s: want exactly 1 ReserveCapacity", tt)
+			}
+		}
+	})
+
+	// A stop or destroy runs on the worker already hosting the environment. If
+	// it reserved capacity of its own, a full node could not free itself — the
+	// only way out of "full" would be blocked by "full".
+	t.Run("releasing task reserves nothing on lease", func(t *testing.T) {
+		for _, tt := range []TaskType{TaskStop, TaskDestroy} {
+			cur := Task{Type: tt, State: TaskQueued, MaxAttempts: 5, FencingToken: 1}
+			res, err := ApplyTask(cur, TaskEvent{Kind: EvLease, FencingToken: 2, WorkerID: "w1"}, t0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Next.Reserved {
+				t.Errorf("%s: must not reserve; the environment already holds capacity here", tt)
+			}
+			if countEffect[ReserveCapacity](res.Effects) != 0 {
+				t.Errorf("%s: want no ReserveCapacity", tt)
+			}
+		}
+	})
+
+	t.Run("successful placement commits rather than releases", func(t *testing.T) {
+		for _, tt := range []TaskType{TaskProvision, TaskStart, TaskRecover} {
+			cur := Task{Type: tt, State: TaskRunning, Attempts: 1, MaxAttempts: 5,
+				FencingToken: 3, WorkerID: "worker-x", Reserved: true}
+			res, err := ApplyTask(cur, TaskEvent{Kind: EvSucceed, FencingToken: 3}, t0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n := countEffect[ReleaseCapacity](res.Effects); n != 0 {
+				t.Errorf("%s: released capacity for a container that is now running", tt)
+			}
+			if n := countEffect[CommitCapacity](res.Effects); n != 1 {
+				t.Errorf("%s: want exactly 1 CommitCapacity, got %d", tt, n)
+			}
+			// The environment lives on this worker now, so the binding stays.
+			if res.Next.WorkerID != "worker-x" {
+				t.Errorf("%s: worker binding must survive a successful placement", tt)
+			}
+		}
+	})
+
+	t.Run("successful release frees the environment's capacity", func(t *testing.T) {
+		for _, tt := range []TaskType{TaskStop, TaskDestroy} {
+			cur := Task{Type: tt, State: TaskRunning, Attempts: 1, MaxAttempts: 5,
+				FencingToken: 3, WorkerID: "worker-x"}
+			res, err := ApplyTask(cur, TaskEvent{Kind: EvSucceed, FencingToken: 3}, t0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertReleasesCapacityOnce(t, res.Effects, "worker-x")
+		}
+	})
+
+	// A stop that fails leaves the container running, so its capacity must stay
+	// allocated. Freeing it here would let the scheduler place new work on
+	// resources a live container is still using.
+	t.Run("failed release keeps capacity allocated", func(t *testing.T) {
+		for _, tt := range []TaskType{TaskStop, TaskDestroy} {
+			cur := Task{Type: tt, State: TaskRunning, Attempts: 1, MaxAttempts: 5,
+				FencingToken: 3, WorkerID: "worker-x"}
+			for _, ev := range []TaskEvent{
+				{Kind: EvFail, FencingToken: 3, Err: "docker rm timed out"},
+				{Kind: EvLeaseExpire},
+			} {
+				res, err := ApplyTask(cur, ev, t0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if n := countEffect[ReleaseCapacity](res.Effects); n != 0 {
+					t.Errorf("%s/%s: freed capacity while the container is still there", tt, ev.Kind)
+				}
+			}
+		}
+	})
+
+	t.Run("snapshot neither reserves nor releases", func(t *testing.T) {
+		cur := Task{Type: TaskSnapshot, State: TaskRunning, Attempts: 1, MaxAttempts: 4,
+			FencingToken: 3, WorkerID: "worker-x"}
+		res, err := ApplyTask(cur, TaskEvent{Kind: EvSucceed, FencingToken: 3}, t0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res.Effects) != 0 {
+			t.Errorf("snapshot produced capacity effects: %+v", res.Effects)
+		}
+	})
+}
+
+func TestTaskTypeClassifiers(t *testing.T) {
+	places := map[TaskType]bool{TaskProvision: true, TaskStart: true, TaskRecover: true}
+	releases := map[TaskType]bool{TaskStop: true, TaskDestroy: true}
+	for _, tt := range []TaskType{TaskProvision, TaskStart, TaskStop, TaskSnapshot, TaskDestroy, TaskRecover} {
+		if tt.Places() != places[tt] {
+			t.Errorf("%s.Places() = %v, want %v", tt, tt.Places(), places[tt])
+		}
+		if tt.Releases() != releases[tt] {
+			t.Errorf("%s.Releases() = %v, want %v", tt, tt.Releases(), releases[tt])
+		}
+		if tt.Places() && tt.Releases() {
+			t.Errorf("%s cannot both place and release", tt)
+		}
+	}
+}
+
+func countEffect[T Effect](effects []Effect) int {
+	var n int
+	for _, e := range effects {
+		if _, ok := e.(T); ok {
+			n++
+		}
+	}
+	return n
 }
 
 // A task that never held a reservation must not release one.

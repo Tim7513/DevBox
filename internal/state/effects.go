@@ -31,6 +31,18 @@ type ReleaseCapacity struct {
 
 func (ReleaseCapacity) isEffect() {}
 
+// CommitCapacity hands a provisional reservation from a completed placing task
+// over to its environment. Numerically it changes nothing — allocated_* already
+// includes the spec and must keep including it, because the container is now
+// really running. It exists as an explicit effect rather than as an absence so
+// that "the task ended and capacity stayed allocated" is a decision recorded in
+// the audit log, not an omission a future reader has to infer.
+type CommitCapacity struct {
+	WorkerID string
+}
+
+func (CommitCapacity) isEffect() {}
+
 // ScheduleRetry sets the backoff gate. The task is queued but invisible to
 // claims until AvailableAt.
 type ScheduleRetry struct {

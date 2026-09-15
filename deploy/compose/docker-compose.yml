@@ -1,0 +1,99 @@
+# DevBox local stack.
+#
+# Brings up the shared infrastructure plus the three services at the replica
+# counts the Definition of Done requires: API x2, scheduler x2 (one leader, one
+# hot standby), workers x3.
+#
+#   docker compose -f deploy/compose/docker-compose.yml up
+#
+# Infrastructure only (what the integration tests need):
+#   docker compose -f deploy/compose/docker-compose.yml up postgres redis minio
+
+name: devbox
+
+x-postgres-env: &postgres-env
+  POSTGRES_USER: devbox
+  POSTGRES_PASSWORD: devbox
+  POSTGRES_DB: devbox
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment: *postgres-env
+    command:
+      # The placement transaction is short and highly contended; these keep a
+      # burst of concurrent schedulers from exhausting connections.
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=256MB
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U devbox -d devbox"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    # Redis carries pub/sub frames and rate-limit buckets only — never job or
+    # environment state — so persistence is deliberately off. Losing this
+    # container costs in-flight log frames and nothing else.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  minio:
+    image: minio/minio:RELEASE.2024-10-13T13-34-11Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: devbox
+      MINIO_ROOT_PASSWORD: devbox-secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+    ports:
+      - "9090:9090"
+    volumes:
+      - ../prometheus:/etc/prometheus:ro
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    ports:
+      - "3000:3000"
+    volumes:
+      - ../grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres-data:
+  minio-data:

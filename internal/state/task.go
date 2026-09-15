@@ -79,6 +79,23 @@ func (t TaskType) Valid() bool {
 	return false
 }
 
+// Places reports whether this task type acquires compute for its environment.
+//
+// The distinction drives the whole reservation lifecycle. A placing task takes
+// a *provisional* reservation when it is leased; on success that reservation is
+// handed over to the environment (whose container now genuinely occupies the
+// resources) and on failure it is rolled back.
+func (t TaskType) Places() bool {
+	return t == TaskProvision || t == TaskStart || t == TaskRecover
+}
+
+// Releases reports whether this task type gives compute back. A releasing task
+// takes no reservation of its own — it runs on the worker already hosting the
+// environment — and frees the environment's reservation when it succeeds.
+func (t TaskType) Releases() bool {
+	return t == TaskStop || t == TaskDestroy
+}
+
 // MaxAttempts is the attempt budget per task type.
 //
 // The budgets differ on purpose. provision and recover pull a repo and a
@@ -250,11 +267,21 @@ func applyLease(cur Task, ev TaskEvent, now time.Time) (TaskResult, error) {
 	next.State = TaskLeased
 	next.FencingToken = ev.FencingToken
 	next.WorkerID = ev.WorkerID
-	next.Reserved = true
+
+	// Only a placing task reserves. A stop or destroy runs on the worker that
+	// is already hosting the environment and consumes nothing new; making it
+	// reserve would double-count the environment against its own worker and
+	// could make a full node refuse to free itself — a deadlock where the only
+	// way out of "full" is blocked by "full".
+	var effects []Effect
+	if cur.Type.Places() {
+		next.Reserved = true
+		effects = append(effects, ReserveCapacity{WorkerID: ev.WorkerID})
+	}
 
 	return TaskResult{
 		Next:    next,
-		Effects: []Effect{ReserveCapacity{WorkerID: ev.WorkerID}},
+		Effects: effects,
 		Audit:   AuditRecord{From: string(cur.State), To: string(next.State), Reason: "leased to worker", Actor: "scheduler", At: now},
 	}, nil
 }
@@ -286,11 +313,32 @@ func applySucceed(cur Task, ev TaskEvent, now time.Time) (TaskResult, error) {
 	}
 	next := cur
 	next.State = TaskSucceeded
-	next.WorkerID = ""
 	next.Reserved = false
+
+	var effects []Effect
+	switch {
+	case cur.Type.Places():
+		// The container is now running and genuinely occupying these
+		// resources. The reservation does not go back to the pool — ownership
+		// moves from the task to the environment, which holds it until a stop
+		// or destroy gives it up. Releasing here would let the scheduler
+		// re-sell capacity that is physically in use, which is the overcommit
+		// bug this whole model exists to prevent.
+		effects = append(effects, CommitCapacity{WorkerID: cur.WorkerID})
+	case cur.Type.Releases():
+		// The container is gone, so the environment's long-held reservation
+		// returns to the pool now.
+		effects = append(effects, ReleaseCapacity{WorkerID: cur.WorkerID})
+	}
+	// The worker binding stays on a successful placing task: the environment
+	// lives there now. It is cleared by the environment FSM when compute ends.
+	if !cur.Type.Places() {
+		next.WorkerID = ""
+	}
+
 	return TaskResult{
 		Next:    next,
-		Effects: releaseIfReserved(cur),
+		Effects: effects,
 		Audit:   AuditRecord{From: string(cur.State), To: string(next.State), Reason: "completed", Actor: "worker:" + cur.WorkerID, At: now},
 	}, nil
 }
@@ -398,9 +446,13 @@ func checkFence(cur Task, ev TaskEvent) error {
 	return nil
 }
 
-// releaseIfReserved emits the capacity-release effect exactly once. Every exit
-// from leased/running funnels through here so a reservation can neither leak
-// nor be released twice.
+// releaseIfReserved rolls back a provisional reservation exactly once.
+//
+// It fires only for a placing task that failed or lost its lease: the compute
+// it was reserving never came into existence, so the capacity goes back to the
+// pool. A releasing task never holds a provisional reservation (see
+// applyLease), so a failed stop correctly leaves the environment's long-held
+// capacity allocated — the container is, after all, still there.
 func releaseIfReserved(cur Task) []Effect {
 	if !cur.Reserved || cur.WorkerID == "" {
 		return nil
